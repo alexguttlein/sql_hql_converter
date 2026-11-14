@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Conversor HQL ↔ Oracle SQL</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/mountable@1.11.2/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/mountable@1.11.2/build/stlite.js";
+
+    const archivos = [
+      "streamlit_app.py",
+      "core/__init__.py",
+      "core/metadata.py",
+      "core/java_preprocessor.py",
+      "converters/__init__.py",
+      "converters/hql_to_sql.py",
+      "converters/sql_to_hql.py",
+    ];
+    const files = {};
+    for (const f of archivos) files[f] = await (await fetch(f)).text();
+
+    mount({ entrypoint: "streamlit_app.py", files }, document.getElementById("root"));
+  </script>
+</body>
+</html>
