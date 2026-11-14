@@ -74,6 +74,21 @@ class HqlToSqlConverter:
             t = token.strip()
             if t in vars_map:
                 return vars_map[t]
+            
+            # new Date(año, mes, día) -> TO_DATE('dd/MM/yyyy','DD/MM/YYYY')
+            date_inline = re.fullmatch(r"new\s+Date\s*\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)", t)
+            if date_inline:
+                y, mo, d = date_inline.groups()
+                return f"TO_DATE('{int(d):02d}/{int(mo):02d}/{y}','DD/MM/YYYY')"
+
+            # getProcessDateTime().getDate() [.addDays(n)] -> SYSDATE [+/- n]
+            sysdate_inline = re.fullmatch(
+                r"getProcessDateTime\s*\(\s*\)\s*\.getDate\s*\(\s*\)(?:\s*\.addDays\s*\(\s*(-?\d+)\s*\))?", t
+            )
+            if sysdate_inline:
+                n = int(sysdate_inline.group(1) or 0)
+                return "SYSDATE" if n == 0 else f"SYSDATE {'+' if n > 0 else '-'} {abs(n)}"
+            
             if t.startswith('"') and t.endswith('"'):
                 return f"'{t[1:-1]}'"
             if "Bool.FALSE" in t or t.lower() == "false":
@@ -196,7 +211,16 @@ class HqlToSqlConverter:
         where_conditions: list[str] = []
 
         if clauses["WHERE"]:
-            raw_conds = re.split(r"\bAND\b", clauses["WHERE"], flags=re.IGNORECASE)
+            protected_where = re.sub(
+                r"(\bBETWEEN\b\s+:\w+)\s+AND\s+",
+                lambda m: f"{m.group(1)} __BETWEEN_AND__ ",
+                clauses["WHERE"],
+                flags=re.IGNORECASE,
+            )
+            raw_conds = [
+                p.replace("__BETWEEN_AND__", "AND")
+                for p in re.split(r"\bAND\b", protected_where, flags=re.IGNORECASE)
+            ]
             joined_aliases = {from_items[0][2]} if from_items else set()
 
             for cond in raw_conds:
@@ -225,6 +249,18 @@ class HqlToSqlConverter:
                             join_clauses.append(f"JOIN {t_ent.table} {t_sql_alias}\n        ON {on_expr}")
                             continue
 
+                # Condición BETWEEN :p1 AND :p2
+                between_match = re.fullmatch(
+                    r"([\w.]+)\s+(NOT\s+)?BETWEEN\s+:(\w+)\s+AND\s+:(\w+)", c, flags=re.IGNORECASE
+                )
+                if between_match:
+                    lhs_sql, _ = self._map_hql_expr(between_match.group(1), alias_map)
+                    neg = "NOT " if between_match.group(2) else ""
+                    v_from = bound_values.get(between_match.group(3), f"':{between_match.group(3).upper()}'")
+                    v_to = bound_values.get(between_match.group(4), f"':{between_match.group(4).upper()}'")
+                    where_conditions.append(f"{lhs_sql} {neg}BETWEEN {v_from} AND {v_to}")
+                    continue
+                
                 # Condición con parámetro (:param)
                 param_match = re.search(r"([\w.]+)\s*(=|!=|<>|>=|<=|>|<|LIKE|IN)\s*:(\w+)", c, flags=re.IGNORECASE)
                 if param_match:
