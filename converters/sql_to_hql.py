@@ -9,9 +9,21 @@ class SqlToHqlConverter:
         self.meta = metadata
 
     @staticmethod
-    def _to_java_date(raw_val: str) -> str:
-        """Convierte fecha 'DD/MM/AAAA' o 'AAAA-MM-DD' en new Date(AAAA, MM, DD)."""
+    def _to_java_date(raw_val: str, date_mask: str | None = None) -> str:
+        """
+        Convierte una fecha SQL en new Date(año, mes, día).
+        - Con máscara de TO_DATE (ej: 'DD/MM/YYYY'), usa el orden indicado por la máscara.
+        - Sin máscara, soporta dd/MM/yyyy y yyyy-MM-dd.
+        """
         text = str(raw_val)
+
+        if date_mask:
+            tokens = re.findall(r"YYYY|MM|DD", date_mask.upper())
+            digits = re.findall(r"\d+", text)
+            if sorted(tokens) == ["DD", "MM", "YYYY"] and len(digits) >= 3:
+                parts = dict(zip(tokens, digits))
+                return f"new Date({int(parts['YYYY'])}, {int(parts['MM'])}, {int(parts['DD'])})"
+
         m = re.fullmatch(r"\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s.*)?", text)  # dd/MM/yyyy
         if m:
             day, month, year = m.groups()
@@ -20,8 +32,81 @@ class SqlToHqlConverter:
             if not m:
                 return f'Date.fromIso("{raw_val}")'  # formato desconocido: comportamiento anterior
             year, month, day = m.groups()
-        # int() elimina ceros a la izquierda (en Java, 08 sería un octal inválido)
         return f"new Date({int(year)}, {int(month)}, {int(day)})"
+
+
+    SYSDATE_EXPR = "getProcessDateTime().getDate()"
+    # Valores SQL soportados: 'texto', número, TO_DATE(...), SYSDATE / TRUNC(SYSDATE) / CURRENT_DATE (+/- días)
+    SQL_VALUE_PATTERN = (
+        r"'[^']*'"
+        r"|-?\d+(?:\.\d+)?"
+        r"|TO_DATE\s*\(\s*'[^']*'\s*(?:,\s*'[^']*'\s*)?\)"
+        r"|(?:TRUNC\s*\(\s*SYSDATE\s*\)|SYSDATE|CURRENT_DATE)(?:\s*[+-]\s*\d+)?"
+    )
+
+    @staticmethod
+    def _split_conditions(text: str) -> list[str]:
+        """Separa por AND sin romper el AND propio de 'BETWEEN x AND y'."""
+        protected = re.sub(
+            r"(\bBETWEEN\b\s+.+?)\s+AND\s+",
+            lambda m: f"{m.group(1)} __BETWEEN_AND__ ",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        parts = re.split(r"\bAND\b", protected, flags=re.IGNORECASE)
+        return [p.replace("__BETWEEN_AND__", "AND").strip() for p in parts if p.strip()]
+
+    @staticmethod
+    def _parse_sql_value(token: str) -> tuple[str, str, str | None]:
+        """Devuelve (tipo, valor, máscara). tipo: str | num | date | sysdate (en sysdate, valor = días de desfase)."""
+        t = token.strip()
+        m = re.fullmatch(r"'([^']*)'", t)
+        if m:
+            return "str", m.group(1), None
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
+            return "num", t, None
+        m = re.fullmatch(r"TO_DATE\s*\(\s*'([^']*)'\s*(?:,\s*'([^']*)'\s*)?\)", t, flags=re.IGNORECASE)
+        if m:
+            return "date", m.group(1), m.group(2)
+        m = re.fullmatch(
+            r"(?:TRUNC\s*\(\s*SYSDATE\s*\)|SYSDATE|CURRENT_DATE)(?:\s*([+-])\s*(\d+))?",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            days = int(m.group(2)) if m.group(2) else 0
+            return "sysdate", str(-days if m.group(1) == "-" else days), None
+        return "str", t, None
+
+    @staticmethod
+    def _split_values(text: str) -> list[str]:
+        """Separa una lista 'a, b, c' por comas de primer nivel (respeta comillas y paréntesis)."""
+        items: list[str] = []
+        buf: list[str] = []
+        depth = 0
+        in_str = False
+        for ch in text:
+            if ch == "'":
+                in_str = not in_str
+            elif not in_str:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    items.append("".join(buf).strip())
+                    buf = []
+                    continue
+            buf.append(ch)
+        items.append("".join(buf).strip())
+        return [i for i in items if i]
+
+    def _java_date_expr(self, kind: str, raw_val: str, date_mask: str | None) -> str:
+        if kind == "sysdate":
+            days = int(raw_val)
+            return self.SYSDATE_EXPR if days == 0 else f"{self.SYSDATE_EXPR}.addDays({days})"
+        return self._to_java_date(raw_val, date_mask)
+
 
     @staticmethod
     def _to_camel_alias(raw_alias: str, entity_name: str, used: set[str]) -> str:
@@ -168,14 +253,14 @@ class SqlToHqlConverter:
             from_entities.append((entity, hql_al))
 
             if len(on_match) > 1:
-                for on_c in re.split(r"\bAND\b", on_match[1], flags=re.IGNORECASE):
+                for on_c in self._split_conditions(on_match[1]):
                     if on_c.strip():
                         join_on_conditions.append(on_c.strip())
 
         # 2. Procesar condiciones (JOIN ON + WHERE)
         all_sql_conds: list[str] = list(join_on_conditions)
         if clauses["WHERE"]:
-            for wc in re.split(r"\bAND\b", clauses["WHERE"], flags=re.IGNORECASE):
+            for wc in self._split_conditions(clauses["WHERE"]):
                 if wc.strip():
                     all_sql_conds.append(wc.strip())
 
@@ -197,10 +282,49 @@ class SqlToHqlConverter:
             used_params.add(cand)
             return cand
 
+        def bind_value(param_name, hql_path, prop_meta, owner_ent, kind, raw_val, date_mask) -> None:
+            """Genera el bind Java adecuado según metadatos de Hibernate y el tipo de valor SQL."""
+            if prop_meta and prop_meta.lookup_class:
+                lookup_note = f"Lookup '{prop_meta.lookup_class}' detectada en Hibernate XML para '{hql_path}'."
+                if lookup_note not in notes:
+                    notes.append(lookup_note)
+                java_binds.append(
+                    f'query.bindLookup("{param_name}", LookupHelper.getLookupInstance({prop_meta.lookup_class}.class, "{raw_val}"));'
+                )
+            elif prop_meta and prop_meta.prop_type == "boolean":
+                b_const = "Bool.TRUE" if str(raw_val).upper() in ("Y", "T", "1", "TRUE") else "Bool.FALSE"
+                java_binds.append(f'query.bindBoolean("{param_name}", {b_const});')
+            elif prop_meta and prop_meta.prop_type == "entity" and prop_meta.target_entity:
+                var_name = unique_param(prop_meta.target_entity)
+                java_pre_decls.append(
+                    f'{prop_meta.target_entity} {var_name} = new {prop_meta.target_entity}_Id("{raw_val}").getEntity();'
+                )
+                java_binds.append(f'query.bindEntity("{param_name}", {var_name});')
+            elif prop_meta and prop_meta.prop_type == "id" and owner_ent:
+                var_name = unique_param(f"{owner_ent.name}Id")
+                java_pre_decls.append(f'{owner_ent.id_class} {var_name} = new {owner_ent.id_class}("{raw_val}");')
+                java_binds.append(f'query.bindId("{param_name}", {var_name});')
+            elif (prop_meta and prop_meta.prop_type == "date") or kind in ("date", "sysdate"):
+                java_binds.append(f'query.bindDate("{param_name}", {self._java_date_expr(kind, raw_val, date_mask)});')
+            elif (prop_meta and prop_meta.prop_type == "decimal") or kind == "num":
+                java_binds.append(f'query.bindBigDecimal("{param_name}", new BigDecimal("{raw_val}"));')
+            elif owner_ent:
+                prop_ref = hql_path.split(".", 1)[1]
+                java_binds.append(
+                    f'query.bindStringProperty("{param_name}", {owner_ent.name}.properties.{prop_ref}, "{raw_val}");'
+                )
+            else:
+                java_binds.append(f'query.bindString("{param_name}", "{raw_val}");')
+
         for cond in all_sql_conds:
             # Igualdad entre dos columnas (Join)
             col_eq = re.fullmatch(r"([\w.]+)\s*=\s*([\w.]+)", cond)
-            if col_eq and not col_eq.group(2).startswith("'") and not col_eq.group(2).isdigit():
+            if (
+                col_eq
+                and not col_eq.group(2).startswith("'")
+                and not col_eq.group(2).isdigit()
+                and col_eq.group(2).upper() not in ("SYSDATE", "CURRENT_DATE")
+            ):
                 lhs_hql, _, _ = self._map_sql_col(col_eq.group(1), alias_map, prefer_id_suffix=True)
                 rhs_hql, _, _ = self._map_sql_col(col_eq.group(2), alias_map, prefer_id_suffix=True)
                 # Mantener orden natural de entidades del FROM
@@ -211,56 +335,54 @@ class SqlToHqlConverter:
                     hql_where_lines.append(f"{lhs_hql} = {rhs_hql}")
                 continue
 
-            # Condición con literal: COL OP 'VAL' o COL OP 123
+            # Condición con literal: COL OP 'VAL' | 123 | TO_DATE(...) | SYSDATE [+/- n]
             lit_match = re.fullmatch(
-                r"([\w.]+)\s*(=|!=|<>|>=|<=|>|<|LIKE)\s*(?:'([^']*)'|(-?\d+(?:\.\d+)?))",
+                rf"([\w.]+)\s*(=|!=|<>|>=|<=|>|<|LIKE)\s*({self.SQL_VALUE_PATTERN})",
                 cond,
                 flags=re.IGNORECASE,
             )
             if lit_match:
-                sql_col = lit_match.group(1)
                 op = lit_match.group(2).upper()
-                str_val = lit_match.group(3)
-                num_val = lit_match.group(4)
-                raw_val = str_val if str_val is not None else num_val
+                kind, raw_val, date_mask = self._parse_sql_value(lit_match.group(3))
 
-                hql_path, prop_meta, owner_ent = self._map_sql_col(sql_col, alias_map, prefer_id_suffix=False)
-                leaf_name = hql_path.split(".")[-1]
-                param_name = unique_param(leaf_name)
+                hql_path, prop_meta, owner_ent = self._map_sql_col(lit_match.group(1), alias_map, prefer_id_suffix=False)
+                param_name = unique_param(hql_path.split(".")[-1])
                 hql_where_lines.append(f"{hql_path} {op} :{param_name}")
+                bind_value(param_name, hql_path, prop_meta, owner_ent, kind, raw_val, date_mask)
+                continue
 
-                # Generar bind adecuado según metadatos de Hibernate
-                if prop_meta and prop_meta.lookup_class:
-                    notes.append(
-                        f"Lookup '{prop_meta.lookup_class}' detectada en Hibernate XML para '{hql_path}'."
-                    )
-                    java_binds.append(
-                        f'query.bindLookup("{param_name}", LookupHelper.getLookupInstance({prop_meta.lookup_class}.class, "{raw_val}"));'
-                    )
-                elif prop_meta and prop_meta.prop_type == "boolean":
-                    b_const = "Bool.TRUE" if str(raw_val).upper() in ("Y", "T", "1", "TRUE") else "Bool.FALSE"
-                    java_binds.append(f'query.bindBoolean("{param_name}", {b_const});')
-                elif prop_meta and prop_meta.prop_type == "entity" and prop_meta.target_entity:
-                    var_name = unique_param(prop_meta.target_entity)
-                    java_pre_decls.append(
-                        f'{prop_meta.target_entity} {var_name} = new {prop_meta.target_entity}_Id("{raw_val}").getEntity();'
-                    )
-                    java_binds.append(f'query.bindEntity("{param_name}", {var_name});')
-                elif prop_meta and prop_meta.prop_type == "id" and owner_ent:
-                    var_name = unique_param(f"{owner_ent.name}Id")
-                    java_pre_decls.append(f'{owner_ent.id_class} {var_name} = new {owner_ent.id_class}("{raw_val}");')
-                    java_binds.append(f'query.bindId("{param_name}", {var_name});')
-                elif prop_meta and prop_meta.prop_type == "date":
-                    java_binds.append(f'query.bindDate("{param_name}", {self._to_java_date(raw_val)});')
-                elif prop_meta and prop_meta.prop_type == "decimal" or num_val is not None:
-                    java_binds.append(f'query.bindBigDecimal("{param_name}", new BigDecimal("{raw_val}"));')
-                elif owner_ent:
-                    prop_ref = hql_path.split(".", 1)[1]
-                    java_binds.append(
-                        f'query.bindStringProperty("{param_name}", {owner_ent.name}.properties.{prop_ref}, "{raw_val}");'
-                    )
-                else:
-                    java_binds.append(f'query.bindString("{param_name}", "{raw_val}");')
+            # Condición BETWEEN: COL [NOT] BETWEEN v1 AND v2
+            between_match = re.fullmatch(
+                rf"([\w.]+)\s+(NOT\s+)?BETWEEN\s+({self.SQL_VALUE_PATTERN})\s+AND\s+({self.SQL_VALUE_PATTERN})",
+                cond,
+                flags=re.IGNORECASE,
+            )
+            if between_match:
+                negation = "NOT " if between_match.group(2) else ""
+                hql_path, prop_meta, owner_ent = self._map_sql_col(between_match.group(1), alias_map, prefer_id_suffix=False)
+                leaf_name = hql_path.split(".")[-1]
+                p_from = unique_param(f"{leaf_name}From")
+                p_to = unique_param(f"{leaf_name}To")
+                hql_where_lines.append(f"{hql_path} {negation}BETWEEN :{p_from} AND :{p_to}")
+                for p_name, token in ((p_from, between_match.group(3)), (p_to, between_match.group(4))):
+                    kind, raw_val, date_mask = self._parse_sql_value(token)
+                    bind_value(p_name, hql_path, prop_meta, owner_ent, kind, raw_val, date_mask)
+                continue
+
+            # Condición IN: COL [NOT] IN (v1, v2, ...)  (las subconsultas IN (SELECT ...) no se transforman)
+            in_match = re.fullmatch(r"([\w.]+)\s+(NOT\s+)?IN\s*\((.*)\)", cond, flags=re.IGNORECASE | re.DOTALL)
+            in_values = self._split_values(in_match.group(3)) if in_match else []
+            if in_values and not re.match(r"\s*SELECT\b", in_match.group(3), flags=re.IGNORECASE):
+                negation = "NOT " if in_match.group(2) else ""
+                hql_path, prop_meta, owner_ent = self._map_sql_col(in_match.group(1), alias_map, prefer_id_suffix=False)
+                leaf_name = hql_path.split(".")[-1]
+                in_params: list[str] = []
+                for token in in_values:
+                    kind, raw_val, date_mask = self._parse_sql_value(token)
+                    p_name = unique_param(leaf_name)
+                    in_params.append(p_name)
+                    bind_value(p_name, hql_path, prop_meta, owner_ent, kind, raw_val, date_mask)
+                hql_where_lines.append(f"{hql_path} {negation}IN ({', '.join(':' + p for p in in_params)})")
                 continue
 
             # Condiciones como IS NULL / IS NOT NULL
