@@ -9,6 +9,21 @@ class SqlToHqlConverter:
         self.meta = metadata
 
     @staticmethod
+    def _to_java_date(raw_val: str) -> str:
+        """Convierte fecha 'DD/MM/AAAA' o 'AAAA-MM-DD' en new Date(AAAA, MM, DD)."""
+        text = str(raw_val)
+        m = re.fullmatch(r"\s*(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s.*)?", text)  # dd/MM/yyyy
+        if m:
+            day, month, year = m.groups()
+        else:
+            m = re.fullmatch(r"\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:[T\s].*)?", text)  # yyyy-MM-dd
+            if not m:
+                return f'Date.fromIso("{raw_val}")'  # formato desconocido: comportamiento anterior
+            year, month, day = m.groups()
+        # int() elimina ceros a la izquierda (en Java, 08 sería un octal inválido)
+        return f"new Date({int(year)}, {int(month)}, {int(day)})"
+
+    @staticmethod
     def _to_camel_alias(raw_alias: str, entity_name: str, used: set[str]) -> str:
         clean = raw_alias.strip()
         if clean.isupper() and len(clean) > 4 and clean.lower().startswith(entity_name[:4].lower()):
@@ -236,7 +251,7 @@ class SqlToHqlConverter:
                     java_pre_decls.append(f'{owner_ent.id_class} {var_name} = new {owner_ent.id_class}("{raw_val}");')
                     java_binds.append(f'query.bindId("{param_name}", {var_name});')
                 elif prop_meta and prop_meta.prop_type == "date":
-                    java_binds.append(f'query.bindDate("{param_name}", Date.fromIso("{raw_val}"));')
+                    java_binds.append(f'query.bindDate("{param_name}", {self._to_java_date(raw_val)});')
                 elif prop_meta and prop_meta.prop_type == "decimal" or num_val is not None:
                     java_binds.append(f'query.bindBigDecimal("{param_name}", new BigDecimal("{raw_val}"));')
                 elif owner_ent:
